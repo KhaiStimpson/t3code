@@ -518,6 +518,24 @@ it.effect("a client caller targets any thread within its ceiling and cannot act 
       code: "runtime_mode_escalation_denied",
     });
 
+    const conditional = {
+      threadId: "other-project-thread",
+      expectedRunId: "run:completed",
+      minInactiveMs: 600_000,
+    };
+    const settled = yield* call("t3_thread_settle_if", conditional, clientScope("auto"));
+    expect(settled.isError).toBe(false);
+    expect(settled.structuredContent).toMatchObject({
+      outcome: "skipped",
+      reason: "pending_input",
+    });
+    const deniedSettle = yield* call(
+      "t3_thread_settle_if",
+      conditional,
+      clientScope("approval-required"),
+    );
+    expect(declaredFailure(deniedSettle)).toMatchObject({ code: "runtime_mode_escalation_denied" });
+
     const forked = yield* call(
       "t3_thread_transfer",
       { action: "fork", sourcePoint: { type: "latest_stable" } },
@@ -543,6 +561,13 @@ it.effect("a client caller targets any thread within its ceiling and cannot act 
                   deletedAt: null,
                 },
               } as never),
+            settleThreadIf: (input) =>
+              Effect.succeed({
+                outcome: "skipped",
+                reason: "pending_input",
+                threadId: input.threadId,
+                runId: input.expectedRunId,
+              }),
             dispatch: () => Effect.succeed({ sequence: 7, storedEvents: [] }),
           }),
         ),

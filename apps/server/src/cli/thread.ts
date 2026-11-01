@@ -1,5 +1,8 @@
 import {
   OrchestratorMcpFailure,
+  ConditionalThreadSettlementInput,
+  ConditionalThreadSettlementResult,
+  ThreadSettlementInactivityMs,
   OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadResult,
   OrchestratorMcpThreadSendResult,
@@ -757,12 +760,87 @@ const threadShowCommand = Command.make("show", {
   ),
 );
 
+const decodeSettlementInactivity = Schema.decodeEffect(ThreadSettlementInactivityMs);
+const decodeConditionalSettlement = Schema.decodeEffect(ConditionalThreadSettlementInput);
+
+export const parseSettlementInactivity = Effect.fn("cli.thread.parseSettlementInactivity")(
+  function* (value: string) {
+    const match = /^([1-9]\d*)(ms|s|m|h|d)$/.exec(value);
+    if (match === null)
+      return yield* new ThreadUsageError({
+        detail:
+          "min-inactive needs a positive integer followed by ms, s, m, h, or d (at most 90 days).",
+      });
+    const factors = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+    const factor = factors[match[2] as keyof typeof factors];
+    return yield* decodeSettlementInactivity(Number(match[1]) * factor).pipe(
+      Effect.mapError(
+        () =>
+          new ThreadUsageError({
+            detail: "min-inactive must be between 1 millisecond and 90 days.",
+          }),
+      ),
+    );
+  },
+);
+
+const threadSettleCommand = Command.make("settle", {
+  ...projectLocationFlags,
+  thread: threadArgument,
+  expectedRunId: Flag.String("if-run").pipe(
+    Flag.withDescription("Settle only if this is still the latest successfully completed run."),
+  ),
+  minInactive: Flag.String("min-inactive").pipe(
+    Flag.withDescription(
+      "Minimum inactivity, such as 10m. Makes one attempt; does not schedule a timer.",
+    ),
+  ),
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription(
+    "Settle a completed thread only while its expected run and inactivity conditions still hold.",
+  ),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const input = yield* decodeConditionalSettlement({
+        threadId: flags.thread.trim(),
+        expectedRunId: flags.expectedRunId.trim(),
+        minInactiveMs: yield* parseSettlementInactivity(flags.minInactive),
+      }).pipe(
+        Effect.mapError(
+          () => new ThreadUsageError({ detail: "A thread id and expected run id are required." }),
+        ),
+      );
+      yield* withThreadTools(
+        flags,
+        Effect.fn("cli.thread.settle")(function* (tools) {
+          const result = yield* tools.call(
+            "t3_thread_settle_if",
+            input,
+            ConditionalThreadSettlementResult,
+          );
+          yield* flags.json
+            ? printJson(result)
+            : Console.log(
+                result.outcome === "skipped"
+                  ? `Skipped: ${result.reason}.`
+                  : `${result.outcome === "settled" ? "Settled" : "Already settled"} at ${result.settledAt}.`,
+              );
+        }),
+      );
+    }).pipe(reportThreadErrors),
+  ),
+);
+
 export const threadCommand = Command.make("thread").pipe(
-  Command.withDescription("Start, message, and read threads on the running server."),
+  Command.withDescription(
+    "Start, message, read, and conditionally settle threads on the running server.",
+  ),
   Command.withSubcommands([
     threadListCommand,
     threadStartCommand,
     threadSendCommand,
     threadShowCommand,
+    threadSettleCommand,
   ]),
 );

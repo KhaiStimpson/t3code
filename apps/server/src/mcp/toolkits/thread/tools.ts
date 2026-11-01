@@ -19,6 +19,8 @@ import {
   RunId,
   NonNegativeInt,
   ProjectId,
+  ConditionalThreadSettlementInput,
+  ConditionalThreadSettlementResult,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Schema from "effect/Schema";
@@ -74,6 +76,19 @@ const commandTool = {
     Crypto.Crypto,
   ],
 };
+const ThreadConditionalSettleTool = Tool.make("t3_thread_settle_if", {
+  ...commandTool,
+  description:
+    "Settle a thread only if expectedRunId is still its latest successful run and it has been inactive for minInactiveMs. Makes one attempt; never schedules a timer. Refuses pending work, questions, PR watches, recovery and user keep-active choices. A skipped result changes nothing; an already_settled result preserves the original timestamp.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    ...ConditionalThreadSettlementInput.fields,
+  }),
+  success: ConditionalThreadSettlementResult,
+})
+  .annotate(Tool.Title, "Conditionally settle a thread")
+  .annotate(Tool.Strict, true)
+  .annotate(Tool.Destructive, true);
 const queueEntry = Schema.Struct({
   queuedRunId: RunId,
   text: Schema.String,
@@ -243,6 +258,7 @@ export const ThreadToolkit = Toolkit.make(
   ThreadConfigureTool,
   ThreadTransferTool,
   ThreadOrganizeTool,
+  ThreadConditionalSettleTool,
   PendingRequestTool,
   QueueTool,
 );

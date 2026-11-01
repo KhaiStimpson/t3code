@@ -63,7 +63,18 @@ export class EventSinkStreamError extends Schema.TaggedError<EventSinkStreamErro
   }
 }
 
-export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStreamError]);
+class EventSinkThreadChangedError extends Schema.TaggedError<EventSinkThreadChangedError>()(
+  "EventSinkThreadChangedError",
+  { threadId: ThreadId },
+) {}
+
+export const isEventSinkThreadChangedError = Schema.is(EventSinkThreadChangedError);
+
+export const EventSinkV2Error = Schema.Union([
+  EventSinkWriteError,
+  EventSinkStreamError,
+  EventSinkThreadChangedError,
+]);
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
@@ -136,6 +147,7 @@ export interface EventSinkV2Shape {
     EventSinkV2Error
   >;
   readonly commitCommand: (input: {
+    readonly expectedThreadSequence?: number;
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
     readonly commandType: string;
@@ -194,6 +206,9 @@ export interface EventSinkV2Shape {
   readonly readByCommandId: (input: {
     readonly commandId: CommandId;
   }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
+  readonly read: (
+    input: Parameters<EventStore.EventStoreV2Shape["read"]>[0],
+  ) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
 }
 
 export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>()(
@@ -637,6 +652,13 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          // Provider events can bypass command locks; reject stale plans inside the write transaction.
+          if (
+            input.expectedThreadSequence !== undefined &&
+            (yield* eventStore.latestSequence({ threadId: input.threadId })) !==
+              input.expectedThreadSequence
+          )
+            return yield* new EventSinkThreadChangedError({ threadId: input.threadId });
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,
@@ -930,13 +952,14 @@ const layerBase: Layer.Layer<
         ),
       commitCommand: (input) =>
         commitCommandEffect(input).pipe(
-          Effect.mapError(
-            (cause) =>
-              new EventSinkWriteError({
-                commandId: input.commandId,
-                eventCount: input.events.length,
-                cause,
-              }),
+          Effect.mapError((cause) =>
+            isEventSinkThreadChangedError(cause)
+              ? cause
+              : new EventSinkWriteError({
+                  commandId: input.commandId,
+                  eventCount: input.events.length,
+                  cause,
+                }),
           ),
         ),
       commitRejectedCommand: (input) =>
@@ -987,6 +1010,10 @@ const layerBase: Layer.Layer<
               }),
           ),
         ),
+      read: (input) =>
+        eventStore
+          .read(input)
+          .pipe(Stream.mapError((cause) => new EventSinkStreamError({ cause }))),
       readByCommandId: (input) =>
         eventStore.readByCommandId(input).pipe(
           Stream.mapError(

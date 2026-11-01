@@ -361,4 +361,17 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       return { sequence: result.sequence };
     }),
   ),
+  t3_thread_settle_if: writesThread((input) =>
+    Effect.gen(function* () {
+      const { threads, projection } = yield* readThread(input.threadId);
+      return yield* threads
+        .settleThreadIf({
+          threadId: projection.thread.id,
+          expectedRunId: input.expectedRunId,
+          minInactiveMs: input.minInactiveMs,
+          commandId: yield* newCommandId(),
+        })
+        .pipe(Effect.mapError(dispatchFailure));
+    }),
+  ),
 });

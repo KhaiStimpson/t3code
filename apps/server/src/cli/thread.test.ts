@@ -2,7 +2,36 @@ import { assert, it } from "@effect/vitest";
 import { RunId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
-import { readLatestMessages, type ThreadTools, waitForRun } from "./thread.ts";
+import {
+  parseSettlementInactivity,
+  readLatestMessages,
+  type ThreadTools,
+  waitForRun,
+} from "./thread.ts";
+
+it.effect(
+  "conditional settlement durations have explicit units and bounded integer precision",
+  () =>
+    Effect.gen(function* () {
+      for (const [value, expected] of [
+        ["1ms", 1],
+        ["10m", 600_000],
+        ["90d", 7_776_000_000],
+      ] as const)
+        assert.equal(yield* parseSettlementInactivity(value), expected);
+      for (const value of [
+        "",
+        "10",
+        "0m",
+        "-1s",
+        "1.5m",
+        "Infinityh",
+        "91d",
+        "999999999999999999999999999d",
+      ])
+        assert.equal((yield* parseSettlementInactivity(value).pipe(Effect.result))._tag, "Failure");
+    }),
+);
 
 const threadId = ThreadId.make("thread-1");
 const runId = RunId.make("run-1");

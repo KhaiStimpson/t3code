@@ -20,6 +20,8 @@ import {
 } from "../sourceControl/threadPullRequests.ts";
 import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+  type ConditionalThreadSettlementInput,
+  type ConditionalThreadSettlementResult,
   type ChatAttachment,
   CommandId,
   type GuestMessageId,
@@ -124,7 +126,12 @@ import {
   isBufferedProviderNotification,
   isUndeliveredMailboxSteer,
 } from "./NotificationMailbox.ts";
-import { EventSinkV2 } from "./EventSink.ts";
+import { EventSinkV2, isEventSinkThreadChangedError } from "./EventSink.ts";
+import {
+  backgroundRosterKey,
+  conditionalSettlementDecision,
+  settlementRecordFields,
+} from "./ConditionalThreadSettlement.ts";
 import {
   decideGuestMessageSend,
   guestShareAfterCancelledSend,
@@ -339,6 +346,9 @@ export interface OrchestratorV2Shape {
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
   ) => Effect.Effect<OrchestratorV2DispatchResult, OrchestratorV2Error>;
+  readonly settleThreadIf: (
+    input: ConditionalThreadSettlementInput & { readonly commandId: CommandId },
+  ) => Effect.Effect<ConditionalThreadSettlementResult, OrchestratorV2Error>;
   readonly autoArmLimitRecovery: (input: {
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
@@ -13243,6 +13253,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
     command: OrchestrationV2ServerCommand,
     sideChatIds: ReadonlyArray<ThreadId> = [],
+    expectedThreadSequence?: number,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.command_id": command.commandId,
@@ -13409,6 +13420,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
+        ...(expectedThreadSequence === undefined ? {} : { expectedThreadSequence }),
         threadId: commandThreadId(command),
         commandType: command.type,
         acceptedAt,
@@ -13802,6 +13814,118 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
     dispatch: dispatchWithReceipt,
+    settleThreadIf: Effect.fn("OrchestratorV2.settleThreadIf")(function (input) {
+      return threadDispatch.withLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const expectedSequence = yield* eventSink
+            .latestSequence({ threadId: input.threadId })
+            .pipe(
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+              ),
+            );
+          const projection = yield* projectionStore
+            .getThreadRecords(input.threadId, settlementRecordFields)
+            .pipe(
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+              ),
+            );
+          if (projection.thread.deletedAt !== null)
+            return yield* new OrchestratorDispatchError({
+              commandId: input.commandId,
+              commandType: "thread.settle",
+              cause: "Thread is deleted.",
+            });
+          const now = yield* DateTime.now;
+          const nowMs = DateTime.toEpochMillis(now);
+          const decision = conditionalSettlementDecision(input, projection, nowMs, 0);
+          if (
+            decision !== null &&
+            (decision.outcome !== "skipped" || decision.reason !== "too_recent")
+          )
+            return decision;
+          for (const run of projection.runs) {
+            if (
+              yield* awaitsRestartContinuation(run).pipe(
+                Effect.mapError(
+                  (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+                ),
+              )
+            )
+              return {
+                threadId: input.threadId,
+                runId: input.expectedRunId,
+                outcome: "skipped",
+                reason: "recovery_armed",
+              } as const;
+          }
+          const rosters = new Map<string, string>();
+          const backgroundActivityMs = yield* eventSink
+            .read({
+              threadId: input.threadId,
+              eventType: "provider-thread.updated",
+              throughSequence: expectedSequence,
+            })
+            .pipe(
+              Stream.runFold(
+                () => 0,
+                (lastActivity, stored) => {
+                  if (stored.event.type !== "provider-thread.updated") return lastActivity;
+                  const provider = stored.event.payload;
+                  const key = backgroundRosterKey(provider);
+                  const previous = rosters.get(provider.id) ?? "[]";
+                  rosters.set(provider.id, key);
+                  return key === previous
+                    ? lastActivity
+                    : Math.max(lastActivity, DateTime.toEpochMillis(stored.event.occurredAt));
+                },
+              ),
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+              ),
+            );
+          const finalDecision = conditionalSettlementDecision(
+            input,
+            projection,
+            nowMs,
+            backgroundActivityMs,
+          );
+          if (finalDecision !== null) return finalDecision;
+          const committed = yield* dispatchWithReceiptEffect(
+            {
+              type: "thread.settle",
+              commandId: input.commandId,
+              threadId: input.threadId,
+              settledAt: now,
+            },
+            [],
+            expectedSequence,
+          ).pipe(
+            Effect.catchTags({
+              OrchestratorDispatchError: (error) =>
+                isEventSinkThreadChangedError(error.cause)
+                  ? Effect.succeed(null)
+                  : Effect.fail(error),
+            }),
+          );
+          if (committed === null)
+            return {
+              threadId: input.threadId,
+              runId: input.expectedRunId,
+              outcome: "skipped",
+              reason: "state_changed",
+            } as const;
+          return {
+            threadId: input.threadId,
+            runId: input.expectedRunId,
+            outcome: "settled",
+            settledAt: DateTime.formatIso(now),
+          } as const;
+        }),
+      );
+    }),
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,

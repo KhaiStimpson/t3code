@@ -114,6 +114,20 @@ the message to read it from stdin.
 2 when the agent waits for an answer you give in the app. Add `--json` for a
 result that always includes the thread id.
 
+### Conditional settlement from scripts
+
+Use conditional settlement when a script needs to tidy a completed conversation without hiding newer work:
+
+```sh
+t3 thread settle <thread-id> --if-run <run-id> --min-inactive 10m --json
+```
+
+This makes one attempt. The expected run must still be the latest successfully completed run, with at least the requested inactivity. Durations use positive integers followed by `ms`, `s`, `m`, `h` or `d`, up to 90 days. T3 checks its current state atomically and respects pending work, questions, PR watches, recovery and keep-active choices.
+
+The result is `settled`, `already_settled` with the original timestamp, or `skipped` with a reason. A skipped result changes nothing and exits zero; the script decides whether to retry. Errors such as denied access or an unsupported server exit nonzero. MCP clients use `t3_thread_settle_if` with `threadId`, `expectedRunId` and `minInactiveMs` under the same write permissions as other thread changes.
+
+Settlement follows the normal session, hook and worktree-retention lifecycle. It preserves conversation history but does not guarantee indefinite checkout retention. This command creates no timer and changes no automatic-settlement default.
+
 ## Remove an agent
 
 Approved agents appear under **Settings → Sharing & access** like other clients.

@@ -10,6 +10,8 @@ import type {
 } from "./ProjectionStore.ts";
 import {
   type ChatAttachment,
+  type ConditionalThreadSettlementInput,
+  type ConditionalThreadSettlementResult,
   CommandId,
   isListedThreadLineage,
   MessageId,
@@ -456,6 +458,9 @@ export interface ThreadManagementServiceShape {
     { readonly sequence: number } | { readonly settlesWhenTurnEnds: true },
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
+  readonly settleThreadIf: (
+    input: ConditionalThreadSettlementInput & { readonly commandId: CommandId },
+  ) => Effect.Effect<ConditionalThreadSettlementResult, Orchestrator.OrchestratorV2Error>;
   readonly interruptThread: (
     input: ThreadManagementInterruptInput,
   ) => Effect.Effect<ThreadManagementInterruptResult, ThreadManagementFailure>;
@@ -1534,6 +1539,10 @@ const make = Effect.gen(function* () {
     waitForThread,
     settleAfterRun,
     settleThread,
+    settleThreadIf: Effect.fn("ThreadManagementService.settleThreadIf")(function* (input) {
+      yield* ensureProjectionTranscript(input.threadId);
+      return yield* orchestrator.settleThreadIf(input);
+    }),
     interruptThread,
     stopDelegatedTasks,
     stopWorkflow,
